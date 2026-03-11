@@ -770,6 +770,7 @@ class TestFileUtils < Test::Unit::TestCase
     check_singleton :rm_rf
 
     return if /mswin|mingw/ =~ RUBY_PLATFORM
+    return if root_in_posix?
 
     mkdir 'tmpdatadir'
     touch 'tmpdatadir/tmpdata'
