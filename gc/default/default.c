@@ -4479,7 +4479,7 @@ gc_mark(rb_objspace_t *objspace, VALUE obj)
                         (void *)objspace->rgengc.parent_object, obj_type_name(objspace->rgengc.parent_object));
     }
 
-    gc_mark_check_t_none(objspace, obj);
+    GC_ASSERT(BUILTIN_TYPE(obj) != T_NONE);
 
     gc_aging(objspace, obj);
     gc_grey(objspace, obj);
