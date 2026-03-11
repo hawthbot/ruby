@@ -537,10 +537,10 @@ typedef struct rb_objspace {
 
     size_t marked_slots;
 
-    /* Green Tea-style page mark queue (FIFO) for cache-friendly marking */
+    /* Green Tea-style page mark stack (LIFO) for DFS page ordering
+     * with per-page batch processing for cache locality */
     struct {
         struct heap_page *head;
-        struct heap_page *tail;
         struct heap_page *currently_scanning; /* page being scanned; skip enqueue */
         bool rescan_needed; /* set by gc_grey when same-page object is marked */
         size_t page_count;
@@ -2988,7 +2988,7 @@ gc_finalize_deferred_register(rb_objspace_t *objspace)
     rb_postponed_job_trigger(objspace->finalize_deferred_pjob);
 }
 
-static inline struct heap_page *mark_queue_dequeue(rb_objspace_t *objspace);
+static inline struct heap_page *mark_queue_pop(rb_objspace_t *objspace);
 
 static void
 gc_abort(void *objspace_ptr)
@@ -3000,7 +3000,7 @@ gc_abort(void *objspace_ptr)
          * will be cleared by rgengc_mark_and_rememberset_clear on next cycle,
          * or by gc_setup_mark_bits during sweep. */
         while (objspace->mark_queue.head) {
-            mark_queue_dequeue(objspace);
+            mark_queue_pop(objspace);
         }
 
         objspace->flags.during_incremental_marking = FALSE;
@@ -4246,37 +4246,35 @@ gc_aging(rb_objspace_t *objspace, VALUE obj, struct heap_page *page)
 }
 
 static inline void
-mark_queue_enqueue(rb_objspace_t *objspace, struct heap_page *page)
+mark_queue_push(rb_objspace_t *objspace, struct heap_page *page)
 {
     if (!page->flags.in_mark_queue) {
         page->flags.in_mark_queue = 1;
-        page->mark_queue_next = NULL;
-        if (objspace->mark_queue.tail) {
-            objspace->mark_queue.tail->mark_queue_next = page;
-        }
-        else {
-            objspace->mark_queue.head = page;
-        }
-        objspace->mark_queue.tail = page;
+        /* LIFO (stack): push to head for DFS-like page ordering.
+         * This preserves locality for tree structures while still
+         * batch-processing same-page objects. */
+        page->mark_queue_next = objspace->mark_queue.head;
+        objspace->mark_queue.head = page;
         objspace->mark_queue.page_count++;
     }
 }
 
 static inline struct heap_page *
-mark_queue_dequeue(rb_objspace_t *objspace)
+mark_queue_pop(rb_objspace_t *objspace)
 {
     struct heap_page *page = objspace->mark_queue.head;
     if (page) {
         objspace->mark_queue.head = page->mark_queue_next;
-        if (!objspace->mark_queue.head) {
-            objspace->mark_queue.tail = NULL;
-        }
         page->flags.in_mark_queue = 0;
         page->mark_queue_next = NULL;
         objspace->mark_queue.page_count--;
     }
     return page;
 }
+
+/* Compat aliases */
+#define mark_queue_enqueue mark_queue_push
+#define mark_queue_dequeue mark_queue_pop
 
 static inline int
 is_mark_queue_empty(rb_objspace_t *objspace)
@@ -5818,7 +5816,7 @@ gc_marks_start(rb_objspace_t *objspace, int full_mark)
 
     /* Reset page mark queue */
     objspace->mark_queue.head = NULL;
-    objspace->mark_queue.tail = NULL;
+    /* (tail removed - LIFO stack, no tail needed) */
     objspace->mark_queue.currently_scanning = NULL;
     objspace->mark_queue.page_count = 0;
 
