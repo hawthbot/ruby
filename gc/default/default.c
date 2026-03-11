@@ -541,6 +541,8 @@ typedef struct rb_objspace {
     struct {
         struct heap_page *head;
         struct heap_page *tail;
+        struct heap_page *currently_scanning; /* page being scanned; skip enqueue */
+        bool rescan_needed; /* set by gc_grey when same-page object is marked */
         size_t page_count;
     } mark_queue;
 
@@ -4305,8 +4307,14 @@ gc_grey(rb_objspace_t *objspace, VALUE obj)
     }
 
     /* Enqueue the page rather than pushing the individual object.
-     * This enables cache-friendly page-at-a-time scanning. */
-    mark_queue_enqueue(objspace, page);
+     * Skip if this page is currently being scanned (the scanning loop
+     * will check for new grey objects after completing its pass). */
+    if (RB_LIKELY(page != objspace->mark_queue.currently_scanning)) {
+        mark_queue_enqueue(objspace, page);
+    }
+    else {
+        objspace->mark_queue.rescan_needed = true;
+    }
 }
 
 static inline void
@@ -4331,7 +4339,14 @@ gc_mark(rb_objspace_t *objspace, VALUE obj)
     GC_ASSERT(!objspace->flags.during_reference_updating);
 
     rgengc_check_relation(objspace, obj);
-    if (!gc_mark_set(objspace, obj)) return; /* already marked */
+
+    /* Inline gc_mark_set + gc_grey to compute page/idx/bit once */
+    struct heap_page *page = GET_HEAP_PAGE(obj);
+    size_t idx = SLOT_BITMAP_INDEX(page, obj);
+    bits_t bit = SLOT_BITMAP_BIT(page, obj);
+
+    if (page->bitmaps[idx].mark & bit) return; /* already marked */
+    page->bitmaps[idx].mark |= bit;
 
     if (0) { // for debug GC marking miss
         RUBY_DEBUG_LOG("%p (%s) parent:%p (%s)",
@@ -4342,7 +4357,23 @@ gc_mark(rb_objspace_t *objspace, VALUE obj)
     GC_ASSERT(BUILTIN_TYPE(obj) != T_NONE);
 
     gc_aging(objspace, obj);
-    gc_grey(objspace, obj);
+
+    /* Inline gc_grey: set marking bit and enqueue page */
+#if RGENGC_CHECK_MODE
+    if (page->bitmaps[idx].marking & bit) rb_bug("gc_mark: %s is already marking.", rb_obj_info(obj));
+#endif
+    page->bitmaps[idx].marking |= bit;
+
+    if (RB_FL_TEST_RAW(obj, RUBY_FL_WEAK_REFERENCE)) {
+        rb_darray_append_without_gc(&objspace->weak_references, obj);
+    }
+
+    if (RB_LIKELY(page != objspace->mark_queue.currently_scanning)) {
+        mark_queue_enqueue(objspace, page);
+    }
+    else {
+        objspace->mark_queue.rescan_needed = true;
+    }
 }
 
 static inline void
@@ -4488,6 +4519,11 @@ gc_mark_children(rb_objspace_t *objspace, VALUE obj)
  * Scans pages from a FIFO queue, processing grey objects (marking bit set)
  * in memory order within each page for cache locality.
  *
+ * When scanning a page, children may be discovered on the same page.
+ * We track this via currently_scanning_page: gc_grey sets marking bits
+ * but skips enqueuing the page since we'll check for new grey objects
+ * after completing the scan pass.
+ *
  * incremental: 0 -> not incremental (do all)
  * incremental: n -> mark at most `n' objects
  */
@@ -4503,52 +4539,57 @@ gc_mark_queued_pages(rb_objspace_t *objspace, int incremental, size_t count)
         int total_slots = page->total_slots;
         int bitmap_plane_count = CEILDIV(total_slots, BITS_BITLENGTH);
 
-        /* Scan grey objects on this page in memory order */
-        uintptr_t p = page->start;
-        for (int i = 0; i < bitmap_plane_count; i++) {
-            /* Snapshot and clear grey bits for this group.
-             * New grey objects may appear during scanning (from gc_mark -> gc_grey),
-             * which will re-enqueue the page. */
-            bits_t grey = page->bitmaps[i].marking;
-            if (grey) {
-                page->bitmaps[i].marking &= ~grey;
+        /* Tell gc_grey not to re-enqueue this page while we're scanning it.
+         * New grey objects on this page will set rescan_needed flag. */
+        objspace->mark_queue.currently_scanning = page;
 
-                do {
-                    int bit = ntz_intptr(grey);
-                    grey &= grey - 1; /* clear lowest set bit */
+        /* Scan grey objects in memory order within the page.
+         * For each bitmap group, drain all grey objects including ones
+         * that appear during scanning (from same-page children).
+         * After the complete pass, rescan only if same-page marking occurred. */
+    rescan:
+        objspace->mark_queue.rescan_needed = false;
+        {
+            uintptr_t p = page->start;
+            for (int i = 0; i < bitmap_plane_count; i++) {
+                bits_t grey;
+                /* Drain this group exhaustively: new objects may be marked
+                 * in this same group while we process it */
+                while ((grey = page->bitmaps[i].marking) != 0) {
+                    page->bitmaps[i].marking = 0;
 
-                    VALUE obj = (VALUE)(p + (size_t)bit * slot_size);
+                    do {
+                        int bit = ntz_intptr(grey);
+                        grey &= grey - 1; /* clear lowest set bit */
 
-                    if (RGENGC_CHECK_MODE && !RVALUE_MARKED(objspace, obj)) {
-                        rb_bug("gc_mark_queued_pages: %s is not marked.", rb_obj_info(obj));
-                    }
+                        VALUE obj = (VALUE)(p + (size_t)bit * slot_size);
 
-                    gc_mark_children(objspace, obj);
-                    scanned_count++;
-
-                    if (incremental &&
-                        scanned_count + (objspace->marked_slots - marked_slots_at_the_beginning) > count) {
-                        /* Re-enqueue this page if it still has grey objects
-                         * (from remaining bits in this group or later groups) */
-                        bits_t remaining = grey; /* unprocessed bits in current group */
-                        if (remaining) {
-                            page->bitmaps[i].marking |= remaining;
-                        }
-                        for (int j = i + 1; j < bitmap_plane_count; j++) {
-                            if (page->bitmaps[j].marking) {
-                                remaining = 1; /* flag to re-enqueue */
-                                break;
-                            }
-                        }
-                        if (remaining) {
-                            mark_queue_enqueue(objspace, page);
-                        }
-                        goto done;
-                    }
-                } while (grey);
+                        GC_ASSERT(RVALUE_MARKED(objspace, obj));
+                        gc_mark_children(objspace, obj);
+                        scanned_count++;
+                    } while (grey);
+                }
+                p += BITS_BITLENGTH * slot_size;
             }
-            p += BITS_BITLENGTH * slot_size;
         }
+
+        if (incremental &&
+            scanned_count + (objspace->marked_slots - marked_slots_at_the_beginning) > count) {
+            /* Incremental budget exhausted; re-enqueue if grey objects remain */
+            if (objspace->mark_queue.rescan_needed) {
+                mark_queue_enqueue(objspace, page);
+            }
+            objspace->mark_queue.currently_scanning = NULL;
+            goto done;
+        }
+
+        /* Rescan only if gc_grey flagged same-page marking in an earlier group.
+         * The while loop within each group already handles same-group marking. */
+        if (objspace->mark_queue.rescan_needed) {
+            goto rescan;
+        }
+
+        objspace->mark_queue.currently_scanning = NULL;
     }
 
 done:
@@ -5768,6 +5809,7 @@ gc_marks_start(rb_objspace_t *objspace, int full_mark)
     /* Reset page mark queue */
     objspace->mark_queue.head = NULL;
     objspace->mark_queue.tail = NULL;
+    objspace->mark_queue.currently_scanning = NULL;
     objspace->mark_queue.page_count = 0;
 
     if (full_mark) {
