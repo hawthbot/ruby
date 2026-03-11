@@ -4209,7 +4209,7 @@ gc_mark_set(rb_objspace_t *objspace, VALUE obj)
 }
 
 static void
-gc_aging(rb_objspace_t *objspace, VALUE obj)
+gc_aging(rb_objspace_t *objspace, VALUE obj, struct heap_page *page)
 {
     /* Disable aging if Major GC's are disabled. This will prevent longish lived
      * objects filling up the heap at the expense of marking many more objects.
@@ -4220,8 +4220,6 @@ gc_aging(rb_objspace_t *objspace, VALUE obj)
      */
     if(!gc_config_full_mark_val)
         return;
-
-    struct heap_page *page = GET_HEAP_PAGE(obj);
 
     GC_ASSERT(RVALUE_MARKING(objspace, obj) == FALSE);
     check_rvalue_consistency(objspace, obj);
@@ -4356,7 +4354,7 @@ gc_mark(rb_objspace_t *objspace, VALUE obj)
 
     GC_ASSERT(BUILTIN_TYPE(obj) != T_NONE);
 
-    gc_aging(objspace, obj);
+    gc_aging(objspace, obj, page);
 
     /* Inline gc_grey: set marking bit and enqueue page */
 #if RGENGC_CHECK_MODE
@@ -6096,7 +6094,7 @@ gc_mark_from(rb_objspace_t *objspace, VALUE obj, VALUE parent)
     gc_mark_set_parent(objspace, parent);
     rgengc_check_relation(objspace, obj);
     if (gc_mark_set(objspace, obj) != FALSE) {
-        gc_aging(objspace, obj);
+        gc_aging(objspace, obj, GET_HEAP_PAGE(obj));
         gc_grey(objspace, obj);
     }
     gc_mark_set_parent_invalid(objspace);
