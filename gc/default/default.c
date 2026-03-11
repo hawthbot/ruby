@@ -793,17 +793,20 @@ struct heap_page {
     struct free_slot *freelist;
     struct ccan_list_node page_node;
 
-    bits_t wb_unprotected_bits[HEAP_PAGE_BITMAP_LIMIT];
-    /* the following three bitmaps are cleared at the beginning of full GC */
-    bits_t mark_bits[HEAP_PAGE_BITMAP_LIMIT];
-    bits_t uncollectible_bits[HEAP_PAGE_BITMAP_LIMIT];
-    bits_t marking_bits[HEAP_PAGE_BITMAP_LIMIT];
-
-    bits_t remembered_bits[HEAP_PAGE_BITMAP_LIMIT];
-
-    /* If set, the object is not movable */
-    bits_t pinned_bits[HEAP_PAGE_BITMAP_LIMIT];
-    bits_t age_bits[HEAP_PAGE_BITMAP_LIMIT * RVALUE_AGE_BIT_COUNT];
+    /*
+     * Bitmaps are stored interleaved (AoS layout) so that all bitmap planes
+     * for the same group of BITS_BITLENGTH slots share a cache line.
+     */
+    struct bitmap_group {
+        bits_t mark;
+        bits_t uncollectible;
+        bits_t wb_unprotected;
+        bits_t marking;
+        bits_t remembered;
+        bits_t pinned;
+        bits_t age_lo;
+        bits_t age_hi;
+    } bitmaps[HEAP_PAGE_BITMAP_LIMIT];
 };
 
 /*
@@ -864,6 +867,16 @@ slot_index_for_offset(size_t offset, uint32_t div_magic)
 #define SLOT_BITMAP_OFFSET(page, p)  (SLOT_INDEX(page, p) & (BITS_BITLENGTH - 1))
 #define SLOT_BITMAP_BIT(page, p)     ((bits_t)1 << SLOT_BITMAP_OFFSET(page, p))
 
+/* Bitmap access macros for AoS layout.
+ * BITMAP_PAGE_*  variants take a (page, obj) pair.
+ * BITMAP_OBJ_*   variants take just an obj (derive the page internally).
+ */
+#define _BITMAP_FIELD_TEST(page, p, field)  ((page)->bitmaps[SLOT_BITMAP_INDEX(page, p)].field & SLOT_BITMAP_BIT(page, p))
+#define _BITMAP_FIELD_SET(page, p, field)   ((page)->bitmaps[SLOT_BITMAP_INDEX(page, p)].field |= SLOT_BITMAP_BIT(page, p))
+#define _BITMAP_FIELD_CLEAR(page, p, field) ((page)->bitmaps[SLOT_BITMAP_INDEX(page, p)].field &= ~SLOT_BITMAP_BIT(page, p))
+
+/* Legacy compatibility: these take a bits_t* and work like before for code that
+ * extracts a plane pointer. Used in a few sweep/bulk loops. */
 #define _MARKED_IN_BITMAP(bits, page, p)  ((bits)[SLOT_BITMAP_INDEX(page, p)] & SLOT_BITMAP_BIT(page, p))
 #define _MARK_IN_BITMAP(bits, page, p)    ((bits)[SLOT_BITMAP_INDEX(page, p)] |= SLOT_BITMAP_BIT(page, p))
 #define _CLEAR_IN_BITMAP(bits, page, p)   ((bits)[SLOT_BITMAP_INDEX(page, p)] &= ~SLOT_BITMAP_BIT(page, p))
@@ -872,22 +885,20 @@ slot_index_for_offset(size_t offset, uint32_t div_magic)
 #define MARK_IN_BITMAP(bits, p)      _MARK_IN_BITMAP(bits, GET_HEAP_PAGE(p), p)
 #define CLEAR_IN_BITMAP(bits, p)     _CLEAR_IN_BITMAP(bits, GET_HEAP_PAGE(p), p)
 
-#define GET_HEAP_MARK_BITS(x)           (&GET_HEAP_PAGE(x)->mark_bits[0])
-#define GET_HEAP_PINNED_BITS(x)         (&GET_HEAP_PAGE(x)->pinned_bits[0])
-#define GET_HEAP_UNCOLLECTIBLE_BITS(x)  (&GET_HEAP_PAGE(x)->uncollectible_bits[0])
-#define GET_HEAP_WB_UNPROTECTED_BITS(x) (&GET_HEAP_PAGE(x)->wb_unprotected_bits[0])
-#define GET_HEAP_MARKING_BITS(x)        (&GET_HEAP_PAGE(x)->marking_bits[0])
+#define GET_HEAP_MARK_BITS(x)           (&GET_HEAP_PAGE(x)->bitmaps[0].mark)
+#define GET_HEAP_PINNED_BITS(x)         (&GET_HEAP_PAGE(x)->bitmaps[0].pinned)
+#define GET_HEAP_UNCOLLECTIBLE_BITS(x)  (&GET_HEAP_PAGE(x)->bitmaps[0].uncollectible)
+#define GET_HEAP_WB_UNPROTECTED_BITS(x) (&GET_HEAP_PAGE(x)->bitmaps[0].wb_unprotected)
+#define GET_HEAP_MARKING_BITS(x)        (&GET_HEAP_PAGE(x)->bitmaps[0].marking)
 
 static int
 RVALUE_AGE_GET(VALUE obj)
 {
     struct heap_page *page = GET_HEAP_PAGE(obj);
-    bits_t *age_bits = page->age_bits;
-    size_t slot_idx = SLOT_INDEX(page, obj);
-    size_t idx = (slot_idx / BITS_BITLENGTH) * 2;
-    int shift = (int)(slot_idx & (BITS_BITLENGTH - 1));
-    int lo = (age_bits[idx] >> shift) & 1;
-    int hi = (age_bits[idx + 1] >> shift) & 1;
+    size_t idx = SLOT_BITMAP_INDEX(page, obj);
+    int shift = (int)SLOT_BITMAP_OFFSET(page, obj);
+    int lo = (page->bitmaps[idx].age_lo >> shift) & 1;
+    int hi = (page->bitmaps[idx].age_hi >> shift) & 1;
     return lo | (hi << 1);
 }
 
@@ -896,14 +907,12 @@ RVALUE_AGE_SET_BITMAP(VALUE obj, int age)
 {
     RUBY_ASSERT(age <= RVALUE_OLD_AGE);
     struct heap_page *page = GET_HEAP_PAGE(obj);
-    bits_t *age_bits = page->age_bits;
-    size_t slot_idx = SLOT_INDEX(page, obj);
-    size_t idx = (slot_idx / BITS_BITLENGTH) * 2;
-    int shift = (int)(slot_idx & (BITS_BITLENGTH - 1));
+    size_t idx = SLOT_BITMAP_INDEX(page, obj);
+    int shift = (int)SLOT_BITMAP_OFFSET(page, obj);
     bits_t mask = (bits_t)1 << shift;
 
-    age_bits[idx]     = (age_bits[idx]     & ~mask) | ((bits_t)(age & 1) << shift);
-    age_bits[idx + 1] = (age_bits[idx + 1] & ~mask) | ((bits_t)((age >> 1) & 1) << shift);
+    page->bitmaps[idx].age_lo = (page->bitmaps[idx].age_lo & ~mask) | ((bits_t)(age & 1) << shift);
+    page->bitmaps[idx].age_hi = (page->bitmaps[idx].age_hi & ~mask) | ((bits_t)((age >> 1) & 1) << shift);
 }
 
 static void
@@ -1238,11 +1247,11 @@ tick(void)
 
 static inline VALUE check_rvalue_consistency(rb_objspace_t *objspace, const VALUE obj);
 
-#define RVALUE_MARKED_BITMAP(obj)         MARKED_IN_BITMAP(GET_HEAP_MARK_BITS(obj), (obj))
-#define RVALUE_WB_UNPROTECTED_BITMAP(obj) MARKED_IN_BITMAP(GET_HEAP_WB_UNPROTECTED_BITS(obj), (obj))
-#define RVALUE_MARKING_BITMAP(obj)        MARKED_IN_BITMAP(GET_HEAP_MARKING_BITS(obj), (obj))
-#define RVALUE_UNCOLLECTIBLE_BITMAP(obj)  MARKED_IN_BITMAP(GET_HEAP_UNCOLLECTIBLE_BITS(obj), (obj))
-#define RVALUE_PINNED_BITMAP(obj)         MARKED_IN_BITMAP(GET_HEAP_PINNED_BITS(obj), (obj))
+#define RVALUE_MARKED_BITMAP(obj)         _BITMAP_FIELD_TEST(GET_HEAP_PAGE(obj), (obj), mark)
+#define RVALUE_WB_UNPROTECTED_BITMAP(obj) _BITMAP_FIELD_TEST(GET_HEAP_PAGE(obj), (obj), wb_unprotected)
+#define RVALUE_MARKING_BITMAP(obj)        _BITMAP_FIELD_TEST(GET_HEAP_PAGE(obj), (obj), marking)
+#define RVALUE_UNCOLLECTIBLE_BITMAP(obj)  _BITMAP_FIELD_TEST(GET_HEAP_PAGE(obj), (obj), uncollectible)
+#define RVALUE_PINNED_BITMAP(obj)         _BITMAP_FIELD_TEST(GET_HEAP_PAGE(obj), (obj), pinned)
 
 static inline int
 RVALUE_MARKED(rb_objspace_t *objspace, VALUE obj)
@@ -1276,7 +1285,7 @@ static inline int
 RVALUE_REMEMBERED(rb_objspace_t *objspace, VALUE obj)
 {
     check_rvalue_consistency(objspace, obj);
-    return MARKED_IN_BITMAP(GET_HEAP_PAGE(obj)->remembered_bits, obj) != 0;
+    return _BITMAP_FIELD_TEST(GET_HEAP_PAGE(obj), obj, remembered) != 0;
 }
 
 static inline int
@@ -1286,9 +1295,9 @@ RVALUE_UNCOLLECTIBLE(rb_objspace_t *objspace, VALUE obj)
     return RVALUE_UNCOLLECTIBLE_BITMAP(obj) != 0;
 }
 
-#define RVALUE_PAGE_WB_UNPROTECTED(page, obj) MARKED_IN_BITMAP((page)->wb_unprotected_bits, (obj))
-#define RVALUE_PAGE_UNCOLLECTIBLE(page, obj)  MARKED_IN_BITMAP((page)->uncollectible_bits, (obj))
-#define RVALUE_PAGE_MARKING(page, obj)        MARKED_IN_BITMAP((page)->marking_bits, (obj))
+#define RVALUE_PAGE_WB_UNPROTECTED(page, obj) _BITMAP_FIELD_TEST(page, obj, wb_unprotected)
+#define RVALUE_PAGE_UNCOLLECTIBLE(page, obj)  _BITMAP_FIELD_TEST(page, obj, uncollectible)
+#define RVALUE_PAGE_MARKING(page, obj)        _BITMAP_FIELD_TEST(page, obj, marking)
 
 static int rgengc_remember(rb_objspace_t *objspace, VALUE obj);
 static void rgengc_mark_and_rememberset_clear(rb_objspace_t *objspace, rb_heap_t *heap);
@@ -1327,7 +1336,7 @@ check_rvalue_consistency_force(rb_objspace_t *objspace, const VALUE obj, int ter
             const int uncollectible_bit = RVALUE_UNCOLLECTIBLE_BITMAP(obj) != 0;
             const int mark_bit = RVALUE_MARKED_BITMAP(obj) != 0;
             const int marking_bit = RVALUE_MARKING_BITMAP(obj) != 0;
-            const int remembered_bit = MARKED_IN_BITMAP(GET_HEAP_PAGE(obj)->remembered_bits, obj) != 0;
+            const int remembered_bit = _BITMAP_FIELD_TEST(GET_HEAP_PAGE(obj), obj, remembered) != 0;
             const int age = RVALUE_AGE_GET((VALUE)obj);
 
             if (heap_page_in_global_empty_pages_pool(objspace, GET_HEAP_PAGE(obj))) {
@@ -1436,7 +1445,7 @@ RVALUE_OLD_P(rb_objspace_t *objspace, VALUE obj)
 static inline void
 RVALUE_PAGE_OLD_UNCOLLECTIBLE_SET(rb_objspace_t *objspace, struct heap_page *page, VALUE obj)
 {
-    MARK_IN_BITMAP(&page->uncollectible_bits[0], obj);
+    _BITMAP_FIELD_SET(page, obj, uncollectible);
     objspace->rgengc.old_objects++;
 
 #if RGENGC_PROFILE >= 2
@@ -1494,10 +1503,10 @@ RVALUE_DEMOTE(rb_objspace_t *objspace, VALUE obj)
     GC_ASSERT(RVALUE_OLD_P(objspace, obj));
 
     if (!is_incremental_marking(objspace) && RVALUE_REMEMBERED(objspace, obj)) {
-        CLEAR_IN_BITMAP(GET_HEAP_PAGE(obj)->remembered_bits, obj);
+        _BITMAP_FIELD_CLEAR(GET_HEAP_PAGE(obj), obj, remembered);
     }
 
-    CLEAR_IN_BITMAP(GET_HEAP_UNCOLLECTIBLE_BITS(obj), obj);
+    _BITMAP_FIELD_CLEAR(GET_HEAP_PAGE(obj), obj, uncollectible);
     RVALUE_AGE_RESET(obj);
 
     if (RVALUE_MARKED(objspace, obj)) {
@@ -2002,8 +2011,7 @@ heap_add_page(rb_objspace_t *objspace, rb_heap_t *heap, struct heap_page *page)
     page->slot_div_magic = slot_div_magics[heap - heaps];
     page->heap = heap;
 
-    memset(&page->wb_unprotected_bits[0], 0, HEAP_PAGE_BITMAP_SIZE);
-    memset(&page->age_bits[0], 0, sizeof(page->age_bits));
+    memset(page->bitmaps, 0, sizeof(page->bitmaps));
 
     asan_unlock_freelist(page);
     page->freelist = NULL;
@@ -2207,7 +2215,7 @@ newobj_init(VALUE klass, VALUE flags, int wb_protected, rb_objspace_t *objspace,
 #endif
 
     if (RB_UNLIKELY(wb_protected == FALSE)) {
-        MARK_IN_BITMAP(GET_HEAP_WB_UNPROTECTED_BITS(obj), obj);
+        _BITMAP_FIELD_SET(GET_HEAP_PAGE(obj), obj, wb_unprotected);
     }
 
 #if RGENGC_PROFILE
@@ -3170,7 +3178,9 @@ static void
 gc_setup_mark_bits(struct heap_page *page)
 {
     /* copy oldgen bitmap to mark bitmap */
-    memcpy(&page->mark_bits[0], &page->uncollectible_bits[0], HEAP_PAGE_BITMAP_SIZE);
+    for (int i = 0; i < HEAP_PAGE_BITMAP_LIMIT; i++) {
+        page->bitmaps[i].mark = page->bitmaps[i].uncollectible;
+    }
 }
 
 static int gc_is_moveable_obj(rb_objspace_t *objspace, VALUE obj);
@@ -3581,7 +3591,7 @@ gc_sweep_page(rb_objspace_t *objspace, rb_heap_t *heap, struct gc_sweep_context 
     GC_ASSERT(sweep_page->heap == heap);
 
     uintptr_t p;
-    bits_t *bits, bitset;
+    bits_t bitset;
 
     gc_report(2, objspace, "page_sweep: start.\n");
 
@@ -3594,30 +3604,27 @@ gc_sweep_page(rb_objspace_t *objspace, rb_heap_t *heap, struct gc_sweep_context 
     sweep_page->free_slots = 0;
 
     p = (uintptr_t)sweep_page->start;
-    bits = sweep_page->mark_bits;
     short slot_size = sweep_page->slot_size;
     int total_slots = sweep_page->total_slots;
     int bitmap_plane_count = CEILDIV(total_slots, BITS_BITLENGTH);
 
     int out_of_range_bits = total_slots % BITS_BITLENGTH;
     if (out_of_range_bits != 0) {
-        bits[bitmap_plane_count - 1] |= ~(((bits_t)1 << out_of_range_bits) - 1);
+        sweep_page->bitmaps[bitmap_plane_count - 1].mark |= ~(((bits_t)1 << out_of_range_bits) - 1);
     }
 
     // Clear wb_unprotected and age bits for all unmarked slots
     {
-        bits_t *wb_unprotected_bits = sweep_page->wb_unprotected_bits;
-        bits_t *age_bits = sweep_page->age_bits;
         for (int i = 0; i < bitmap_plane_count; i++) {
-            bits_t unmarked = ~bits[i];
-            wb_unprotected_bits[i] &= ~unmarked;
-            age_bits[i * 2] &= ~unmarked;
-            age_bits[i * 2 + 1] &= ~unmarked;
+            bits_t unmarked = ~sweep_page->bitmaps[i].mark;
+            sweep_page->bitmaps[i].wb_unprotected &= ~unmarked;
+            sweep_page->bitmaps[i].age_lo &= ~unmarked;
+            sweep_page->bitmaps[i].age_hi &= ~unmarked;
         }
     }
 
     for (int i = 0; i < bitmap_plane_count; i++) {
-        bitset = ~bits[i];
+        bitset = ~sweep_page->bitmaps[i].mark;
         if (bitset) {
             gc_sweep_plane(objspace, heap, p, bitset, ctx);
         }
@@ -4046,7 +4053,7 @@ invalidate_moved_plane(rb_objspace_t *objspace, struct heap_page *page, uintptr_
                     GC_ASSERT(RVALUE_PINNED(objspace, forwarding_object));
                     GC_ASSERT(!RVALUE_MARKED(objspace, forwarding_object));
 
-                    CLEAR_IN_BITMAP(GET_HEAP_PINNED_BITS(forwarding_object), forwarding_object);
+                    _BITMAP_FIELD_CLEAR(GET_HEAP_PAGE(forwarding_object), forwarding_object, pinned);
 
                     object = rb_gc_impl_location(objspace, forwarding_object);
 
@@ -4083,21 +4090,17 @@ static void
 invalidate_moved_page(rb_objspace_t *objspace, struct heap_page *page)
 {
     int i;
-    bits_t *mark_bits, *pin_bits;
     bits_t bitset;
     short slot_size = page->slot_size;
     int total_slots = page->total_slots;
     int bitmap_plane_count = CEILDIV(total_slots, BITS_BITLENGTH);
-
-    mark_bits = page->mark_bits;
-    pin_bits = page->pinned_bits;
 
     uintptr_t p = page->start;
 
     for (i=0; i < bitmap_plane_count; i++) {
         /* Moved objects are pinned but never marked. We reuse the pin bits
          * to indicate there is a moved object in this slot. */
-        bitset = pin_bits[i] & ~mark_bits[i];
+        bitset = page->bitmaps[i].pinned & ~page->bitmaps[i].mark;
         invalidate_moved_plane(objspace, page, p, bitset);
         p += BITS_BITLENGTH * slot_size;
     }
@@ -4382,7 +4385,7 @@ static inline int
 gc_mark_set(rb_objspace_t *objspace, VALUE obj)
 {
     if (RVALUE_MARKED(objspace, obj)) return 0;
-    MARK_IN_BITMAP(GET_HEAP_MARK_BITS(obj), obj);
+    _BITMAP_FIELD_SET(GET_HEAP_PAGE(obj), obj, mark);
     return 1;
 }
 
@@ -4436,7 +4439,7 @@ gc_grey(rb_objspace_t *objspace, VALUE obj)
 #endif
 
     if (is_incremental_marking(objspace)) {
-        MARK_IN_BITMAP(GET_HEAP_MARKING_BITS(obj), obj);
+        _BITMAP_FIELD_SET(GET_HEAP_PAGE(obj), obj, marking);
     }
 
     if (RB_FL_TEST_RAW(obj, RUBY_FL_WEAK_REFERENCE)) {
@@ -4491,7 +4494,7 @@ gc_pin(rb_objspace_t *objspace, VALUE obj)
             if (!RVALUE_PINNED(objspace, obj)) {
                 GC_ASSERT(GET_HEAP_PAGE(obj)->pinned_slots <= GET_HEAP_PAGE(obj)->total_slots);
                 GET_HEAP_PAGE(obj)->pinned_slots++;
-                MARK_IN_BITMAP(GET_HEAP_PINNED_BITS(obj), obj);
+                _BITMAP_FIELD_SET(GET_HEAP_PAGE(obj), obj, pinned);
             }
         }
     }
@@ -4644,7 +4647,7 @@ gc_mark_stacked_objects(rb_objspace_t *objspace, int incremental, size_t count)
             if (RGENGC_CHECK_MODE && !RVALUE_MARKING(objspace, obj)) {
                 rb_bug("gc_mark_stacked_objects: incremental, but marking bit is 0");
             }
-            CLEAR_IN_BITMAP(GET_HEAP_MARKING_BITS(obj), obj);
+            _BITMAP_FIELD_CLEAR(GET_HEAP_PAGE(obj), obj, marking);
             popped_count++;
 
             if (popped_count + (objspace->marked_slots - marked_slots_at_the_beginning) > count) {
@@ -5280,11 +5283,9 @@ static int
 gc_remember_unprotected(rb_objspace_t *objspace, VALUE obj)
 {
     struct heap_page *page = GET_HEAP_PAGE(obj);
-    bits_t *uncollectible_bits = &page->uncollectible_bits[0];
-
-    if (!MARKED_IN_BITMAP(uncollectible_bits, obj)) {
+    if (!_BITMAP_FIELD_TEST(page, obj, uncollectible)) {
         page->flags.has_uncollectible_wb_unprotected_objects = TRUE;
-        MARK_IN_BITMAP(uncollectible_bits, obj);
+        _BITMAP_FIELD_SET(page, obj, uncollectible);
         objspace->rgengc.uncollectible_wb_unprotected_objects++;
 
 #if RGENGC_PROFILE > 0
@@ -5323,8 +5324,6 @@ gc_marks_wb_unprotected_objects(rb_objspace_t *objspace, rb_heap_t *heap)
     struct heap_page *page = 0;
 
     ccan_list_for_each(&heap->pages, page, page_node) {
-        bits_t *mark_bits = page->mark_bits;
-        bits_t *wbun_bits = page->wb_unprotected_bits;
         uintptr_t p = page->start;
         short slot_size = page->slot_size;
         int total_slots = page->total_slots;
@@ -5332,7 +5331,7 @@ gc_marks_wb_unprotected_objects(rb_objspace_t *objspace, rb_heap_t *heap)
         size_t j;
 
         for (j=0; j<(size_t)bitmap_plane_count; j++) {
-            bits_t bits = mark_bits[j] & wbun_bits[j];
+            bits_t bits = page->bitmaps[j].mark & page->bitmaps[j].wb_unprotected;
             gc_marks_wb_unprotected_objects_plane(objspace, p, bits, slot_size);
             p += BITS_BITLENGTH * slot_size;
         }
@@ -5622,19 +5621,15 @@ gc_compact_page(rb_objspace_t *objspace, rb_heap_t *heap, struct heap_page *page
 {
     GC_ASSERT(page == heap->compact_cursor);
 
-    bits_t *mark_bits, *pin_bits;
     bits_t bitset;
     uintptr_t p = page->start;
     short slot_size = page->slot_size;
     int total_slots = page->total_slots;
     int bitmap_plane_count = CEILDIV(total_slots, BITS_BITLENGTH);
 
-    mark_bits = page->mark_bits;
-    pin_bits = page->pinned_bits;
-
     for (int j = 0; j < bitmap_plane_count; j++) {
         // objects that can be moved are marked and not pinned
-        bitset = (mark_bits[j] & ~pin_bits[j]);
+        bitset = (page->bitmaps[j].mark & ~page->bitmaps[j].pinned);
         if (bitset) {
             if (!gc_compact_plane(objspace, heap, (uintptr_t)p, bitset, page))
                 return false;
@@ -5880,14 +5875,13 @@ static int
 rgengc_remembersetbits_set(rb_objspace_t *objspace, VALUE obj)
 {
     struct heap_page *page = GET_HEAP_PAGE(obj);
-    bits_t *bits = &page->remembered_bits[0];
 
-    if (MARKED_IN_BITMAP(bits, obj)) {
+    if (_BITMAP_FIELD_TEST(page, obj, remembered)) {
         return FALSE;
     }
     else {
         page->flags.has_remembered_objects = TRUE;
-        MARK_IN_BITMAP(bits, obj);
+        _BITMAP_FIELD_SET(page, obj, remembered);
         return TRUE;
     }
 }
@@ -5965,17 +5959,14 @@ rgengc_rememberset_mark(rb_objspace_t *objspace, rb_heap_t *heap)
             int total_slots = page->total_slots;
             int bitmap_plane_count = CEILDIV(total_slots, BITS_BITLENGTH);
             bits_t bitset, bits[HEAP_PAGE_BITMAP_LIMIT];
-            bits_t *remembered_bits = page->remembered_bits;
-            bits_t *uncollectible_bits = page->uncollectible_bits;
-            bits_t *wb_unprotected_bits = page->wb_unprotected_bits;
 #if PROFILE_REMEMBERSET_MARK
             if (page->flags.has_remembered_objects && page->flags.has_uncollectible_wb_unprotected_objects) has_both++;
             else if (page->flags.has_remembered_objects) has_old++;
             else if (page->flags.has_uncollectible_wb_unprotected_objects) has_shady++;
 #endif
             for (j=0; j < (size_t)bitmap_plane_count; j++) {
-                bits[j] = remembered_bits[j] | (uncollectible_bits[j] & wb_unprotected_bits[j]);
-                remembered_bits[j] = 0;
+                bits[j] = page->bitmaps[j].remembered | (page->bitmaps[j].uncollectible & page->bitmaps[j].wb_unprotected);
+                page->bitmaps[j].remembered = 0;
             }
             page->flags.has_remembered_objects = FALSE;
 
@@ -6004,11 +5995,13 @@ rgengc_mark_and_rememberset_clear(rb_objspace_t *objspace, rb_heap_t *heap)
     struct heap_page *page = 0;
 
     ccan_list_for_each(&heap->pages, page, page_node) {
-        memset(&page->mark_bits[0],       0, HEAP_PAGE_BITMAP_SIZE);
-        memset(&page->uncollectible_bits[0], 0, HEAP_PAGE_BITMAP_SIZE);
-        memset(&page->marking_bits[0],    0, HEAP_PAGE_BITMAP_SIZE);
-        memset(&page->remembered_bits[0], 0, HEAP_PAGE_BITMAP_SIZE);
-        memset(&page->pinned_bits[0],     0, HEAP_PAGE_BITMAP_SIZE);
+        for (int i = 0; i < HEAP_PAGE_BITMAP_LIMIT; i++) {
+            page->bitmaps[i].mark = 0;
+            page->bitmaps[i].uncollectible = 0;
+            page->bitmaps[i].marking = 0;
+            page->bitmaps[i].remembered = 0;
+            page->bitmaps[i].pinned = 0;
+        }
         page->flags.has_uncollectible_wb_unprotected_objects = FALSE;
         page->flags.has_remembered_objects = FALSE;
     }
@@ -6073,7 +6066,7 @@ gc_writebarrier_incremental(VALUE a, VALUE b, rb_objspace_t *objspace)
         }
 
         if (RB_UNLIKELY(objspace->flags.during_compacting)) {
-            MARK_IN_BITMAP(GET_HEAP_PINNED_BITS(b), b);
+            _BITMAP_FIELD_SET(GET_HEAP_PAGE(b), b, pinned);
         }
     }
 }
@@ -6159,7 +6152,7 @@ rb_gc_impl_writebarrier_unprotect(void *objspace_ptr, VALUE obj)
             }
 
             RB_DEBUG_COUNTER_INC(obj_wb_unprotect);
-            MARK_IN_BITMAP(GET_HEAP_WB_UNPROTECTED_BITS(obj), obj);
+            _BITMAP_FIELD_SET(GET_HEAP_PAGE(obj), obj, wb_unprotected);
         }
         RB_GC_VM_UNLOCK_NO_BARRIER(lev);
     }
@@ -6946,7 +6939,7 @@ gc_move(rb_objspace_t *objspace, VALUE src, VALUE dest, size_t src_slot_size, si
     gc_report(4, objspace, "Moving object: %p -> %p\n", (void *)src, (void *)dest);
 
     GC_ASSERT(BUILTIN_TYPE(src) != T_NONE);
-    GC_ASSERT(!MARKED_IN_BITMAP(GET_HEAP_MARK_BITS(dest), dest));
+    GC_ASSERT(!_BITMAP_FIELD_TEST(GET_HEAP_PAGE(dest), dest, mark));
 
     GC_ASSERT(!RVALUE_MARKING(objspace, src));
 
@@ -6958,10 +6951,10 @@ gc_move(rb_objspace_t *objspace, VALUE src, VALUE dest, size_t src_slot_size, si
     age = RVALUE_AGE_GET(src);
 
     /* Clear bits for eventual T_MOVED */
-    CLEAR_IN_BITMAP(GET_HEAP_MARK_BITS(src), src);
-    CLEAR_IN_BITMAP(GET_HEAP_WB_UNPROTECTED_BITS(src), src);
-    CLEAR_IN_BITMAP(GET_HEAP_UNCOLLECTIBLE_BITS(src), src);
-    CLEAR_IN_BITMAP(GET_HEAP_PAGE(src)->remembered_bits, src);
+    _BITMAP_FIELD_CLEAR(GET_HEAP_PAGE(src), src, mark);
+    _BITMAP_FIELD_CLEAR(GET_HEAP_PAGE(src), src, wb_unprotected);
+    _BITMAP_FIELD_CLEAR(GET_HEAP_PAGE(src), src, uncollectible);
+    _BITMAP_FIELD_CLEAR(GET_HEAP_PAGE(src), src, remembered);
 
     /* Move the object */
     memcpy((void *)dest, (void *)src, MIN(src_slot_size, slot_size));
@@ -6978,31 +6971,31 @@ gc_move(rb_objspace_t *objspace, VALUE src, VALUE dest, size_t src_slot_size, si
 
     /* Set bits for object in new location */
     if (remembered) {
-        MARK_IN_BITMAP(GET_HEAP_PAGE(dest)->remembered_bits, dest);
+        _BITMAP_FIELD_SET(GET_HEAP_PAGE(dest), dest, remembered);
     }
     else {
-        CLEAR_IN_BITMAP(GET_HEAP_PAGE(dest)->remembered_bits, dest);
+        _BITMAP_FIELD_CLEAR(GET_HEAP_PAGE(dest), dest, remembered);
     }
 
     if (marked) {
-        MARK_IN_BITMAP(GET_HEAP_MARK_BITS(dest), dest);
+        _BITMAP_FIELD_SET(GET_HEAP_PAGE(dest), dest, mark);
     }
     else {
-        CLEAR_IN_BITMAP(GET_HEAP_MARK_BITS(dest), dest);
+        _BITMAP_FIELD_CLEAR(GET_HEAP_PAGE(dest), dest, mark);
     }
 
     if (wb_unprotected) {
-        MARK_IN_BITMAP(GET_HEAP_WB_UNPROTECTED_BITS(dest), dest);
+        _BITMAP_FIELD_SET(GET_HEAP_PAGE(dest), dest, wb_unprotected);
     }
     else {
-        CLEAR_IN_BITMAP(GET_HEAP_WB_UNPROTECTED_BITS(dest), dest);
+        _BITMAP_FIELD_CLEAR(GET_HEAP_PAGE(dest), dest, wb_unprotected);
     }
 
     if (uncollectible) {
-        MARK_IN_BITMAP(GET_HEAP_UNCOLLECTIBLE_BITS(dest), dest);
+        _BITMAP_FIELD_SET(GET_HEAP_PAGE(dest), dest, uncollectible);
     }
     else {
-        CLEAR_IN_BITMAP(GET_HEAP_UNCOLLECTIBLE_BITS(dest), dest);
+        _BITMAP_FIELD_CLEAR(GET_HEAP_PAGE(dest), dest, uncollectible);
     }
 
     RVALUE_AGE_SET(dest, age);
