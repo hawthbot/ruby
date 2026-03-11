@@ -17,6 +17,7 @@
 
 #ifdef BUILDING_MODULAR_GC
 # define nlz_int64(x) (x == 0 ? 64 : (unsigned int)__builtin_clzll((unsigned long long)x))
+# define ntz_intptr(x) ((x) == 0 ? (int)(sizeof(uintptr_t) * CHAR_BIT) : (int)__builtin_ctzll((unsigned long long)(x)))
 #else
 # include "internal/bits.h"
 #endif
@@ -534,8 +535,14 @@ typedef struct rb_objspace {
         rb_atomic_t finalizing;
     } atomic_flags;
 
-    mark_stack_t mark_stack;
     size_t marked_slots;
+
+    /* Green Tea-style page mark queue (FIFO) for cache-friendly marking */
+    struct {
+        struct heap_page *head;
+        struct heap_page *tail;
+        size_t page_count;
+    } mark_queue;
 
     struct {
         rb_darray(struct heap_page *) sorted;
@@ -783,11 +790,13 @@ struct heap_page {
         unsigned int before_sweep : 1;
         unsigned int has_remembered_objects : 1;
         unsigned int has_uncollectible_wb_unprotected_objects : 1;
+        unsigned int in_mark_queue : 1;
     } flags;
 
     rb_heap_t *heap;
 
     struct heap_page *free_next;
+    struct heap_page *mark_queue_next;
     struct heap_page_body *body;
     uintptr_t start;
     struct free_slot *freelist;
@@ -1085,7 +1094,6 @@ static bool ruby_enable_autocompact = false;
 static gc_compact_compare_func ruby_autocompact_compare_func;
 #endif
 
-static void init_mark_stack(mark_stack_t *stack);
 static int garbage_collect(rb_objspace_t *, unsigned int reason);
 
 static int  gc_start(rb_objspace_t *objspace, unsigned int reason);
@@ -1390,7 +1398,7 @@ check_rvalue_consistency_force(rb_objspace_t *objspace, const VALUE obj, int ter
              * marked:false  white         *invalid*
              * marked:true   black         grey
              */
-            if (is_incremental_marking(objspace) && marking_bit) {
+            if (marking_bit) {
                 if (!is_marking(objspace) && !mark_bit) {
                     fprintf(stderr, "check_rvalue_consistency: %s is marking, but not marked.\n", rb_obj_info(obj));
                     err++;
@@ -1631,8 +1639,6 @@ rb_gc_impl_garbage_object_p(void *objspace_ptr, VALUE ptr)
         !RVALUE_MARKED(objspace, ptr);
 }
 
-static void free_stack_chunks(mark_stack_t *);
-static void mark_stack_free_cache(mark_stack_t *);
 static void heap_page_free(rb_objspace_t *objspace, struct heap_page *page);
 
 static inline void
@@ -2981,7 +2987,7 @@ gc_finalize_deferred_register(rb_objspace_t *objspace)
     rb_postponed_job_trigger(objspace->finalize_deferred_pjob);
 }
 
-static int pop_mark_stack(mark_stack_t *stack, VALUE *data);
+static inline struct heap_page *mark_queue_dequeue(rb_objspace_t *objspace);
 
 static void
 gc_abort(void *objspace_ptr)
@@ -2989,9 +2995,15 @@ gc_abort(void *objspace_ptr)
     rb_objspace_t *objspace = objspace_ptr;
 
     if (is_incremental_marking(objspace)) {
-        /* Remove all objects from the mark stack. */
-        VALUE obj;
-        while (pop_mark_stack(&objspace->mark_stack, &obj));
+        /* Drain the page mark queue and clear all marking bits. */
+        while (objspace->mark_queue.head) {
+            struct heap_page *page = mark_queue_dequeue(objspace);
+            int total_slots = page->total_slots;
+            int bitmap_plane_count = CEILDIV(total_slots, BITS_BITLENGTH);
+            for (int i = 0; i < bitmap_plane_count; i++) {
+                page->bitmaps[i].marking = 0;
+            }
+        }
 
         objspace->flags.during_incremental_marking = FALSE;
     }
@@ -4174,201 +4186,6 @@ gc_sweep(rb_objspace_t *objspace)
     gc_sweeping_exit(objspace);
 }
 
-/* Marking - Marking stack */
-
-static stack_chunk_t *
-stack_chunk_alloc(void)
-{
-    stack_chunk_t *res;
-
-    res = malloc(sizeof(stack_chunk_t));
-    if (!res)
-        rb_memerror();
-
-    return res;
-}
-
-static inline int
-is_mark_stack_empty(mark_stack_t *stack)
-{
-    return stack->chunk == NULL;
-}
-
-static size_t
-mark_stack_size(mark_stack_t *stack)
-{
-    size_t size = stack->index;
-    stack_chunk_t *chunk = stack->chunk ? stack->chunk->next : NULL;
-
-    while (chunk) {
-        size += stack->limit;
-        chunk = chunk->next;
-    }
-    return size;
-}
-
-static void
-add_stack_chunk_cache(mark_stack_t *stack, stack_chunk_t *chunk)
-{
-    chunk->next = stack->cache;
-    stack->cache = chunk;
-    stack->cache_size++;
-}
-
-static void
-shrink_stack_chunk_cache(mark_stack_t *stack)
-{
-    stack_chunk_t *chunk;
-
-    if (stack->unused_cache_size > (stack->cache_size/2)) {
-        chunk = stack->cache;
-        stack->cache = stack->cache->next;
-        stack->cache_size--;
-        free(chunk);
-    }
-    stack->unused_cache_size = stack->cache_size;
-}
-
-static void
-push_mark_stack_chunk(mark_stack_t *stack)
-{
-    stack_chunk_t *next;
-
-    GC_ASSERT(stack->index == stack->limit);
-
-    if (stack->cache_size > 0) {
-        next = stack->cache;
-        stack->cache = stack->cache->next;
-        stack->cache_size--;
-        if (stack->unused_cache_size > stack->cache_size)
-            stack->unused_cache_size = stack->cache_size;
-    }
-    else {
-        next = stack_chunk_alloc();
-    }
-    next->next = stack->chunk;
-    stack->chunk = next;
-    stack->index = 0;
-}
-
-static void
-pop_mark_stack_chunk(mark_stack_t *stack)
-{
-    stack_chunk_t *prev;
-
-    prev = stack->chunk->next;
-    GC_ASSERT(stack->index == 0);
-    add_stack_chunk_cache(stack, stack->chunk);
-    stack->chunk = prev;
-    stack->index = stack->limit;
-}
-
-static void
-mark_stack_chunk_list_free(stack_chunk_t *chunk)
-{
-    stack_chunk_t *next = NULL;
-
-    while (chunk != NULL) {
-        next = chunk->next;
-        free(chunk);
-        chunk = next;
-    }
-}
-
-static void
-free_stack_chunks(mark_stack_t *stack)
-{
-    mark_stack_chunk_list_free(stack->chunk);
-}
-
-static void
-mark_stack_free_cache(mark_stack_t *stack)
-{
-    mark_stack_chunk_list_free(stack->cache);
-    stack->cache_size = 0;
-    stack->unused_cache_size = 0;
-}
-
-static void
-push_mark_stack(mark_stack_t *stack, VALUE obj)
-{
-    switch (BUILTIN_TYPE(obj)) {
-      case T_OBJECT:
-      case T_CLASS:
-      case T_MODULE:
-      case T_FLOAT:
-      case T_STRING:
-      case T_REGEXP:
-      case T_ARRAY:
-      case T_HASH:
-      case T_STRUCT:
-      case T_BIGNUM:
-      case T_FILE:
-      case T_DATA:
-      case T_MATCH:
-      case T_COMPLEX:
-      case T_RATIONAL:
-      case T_TRUE:
-      case T_FALSE:
-      case T_SYMBOL:
-      case T_IMEMO:
-      case T_ICLASS:
-        if (stack->index == stack->limit) {
-            push_mark_stack_chunk(stack);
-        }
-        stack->chunk->data[stack->index++] = obj;
-        return;
-
-      case T_NONE:
-      case T_NIL:
-      case T_FIXNUM:
-      case T_MOVED:
-      case T_ZOMBIE:
-      case T_UNDEF:
-      case T_MASK:
-        rb_bug("push_mark_stack() called for broken object");
-        break;
-
-      case T_NODE:
-        rb_bug("push_mark_stack: unexpected T_NODE object");
-        break;
-    }
-
-    rb_bug("rb_gc_mark(): unknown data type 0x%x(%p) %s",
-            BUILTIN_TYPE(obj), (void *)obj,
-            is_pointer_to_heap((rb_objspace_t *)rb_gc_get_objspace(), (void *)obj) ? "corrupted object" : "non object");
-}
-
-static int
-pop_mark_stack(mark_stack_t *stack, VALUE *data)
-{
-    if (is_mark_stack_empty(stack)) {
-        return FALSE;
-    }
-    if (stack->index == 1) {
-        *data = stack->chunk->data[--stack->index];
-        pop_mark_stack_chunk(stack);
-    }
-    else {
-        *data = stack->chunk->data[--stack->index];
-    }
-    return TRUE;
-}
-
-static void
-init_mark_stack(mark_stack_t *stack)
-{
-    int i;
-
-    MEMZERO(stack, mark_stack_t, 1);
-    stack->index = stack->limit = STACK_CHUNK_SIZE;
-
-    for (i=0; i < 4; i++) {
-        add_stack_chunk_cache(stack, stack_chunk_alloc());
-    }
-    stack->unused_cache_size = stack->cache_size;
-}
-
 /* Marking */
 
 static void
@@ -4430,23 +4247,66 @@ gc_aging(rb_objspace_t *objspace, VALUE obj)
     objspace->marked_slots++;
 }
 
+static inline void
+mark_queue_enqueue(rb_objspace_t *objspace, struct heap_page *page)
+{
+    if (!page->flags.in_mark_queue) {
+        page->flags.in_mark_queue = 1;
+        page->mark_queue_next = NULL;
+        if (objspace->mark_queue.tail) {
+            objspace->mark_queue.tail->mark_queue_next = page;
+        }
+        else {
+            objspace->mark_queue.head = page;
+        }
+        objspace->mark_queue.tail = page;
+        objspace->mark_queue.page_count++;
+    }
+}
+
+static inline struct heap_page *
+mark_queue_dequeue(rb_objspace_t *objspace)
+{
+    struct heap_page *page = objspace->mark_queue.head;
+    if (page) {
+        objspace->mark_queue.head = page->mark_queue_next;
+        if (!objspace->mark_queue.head) {
+            objspace->mark_queue.tail = NULL;
+        }
+        page->flags.in_mark_queue = 0;
+        page->mark_queue_next = NULL;
+        objspace->mark_queue.page_count--;
+    }
+    return page;
+}
+
+static inline int
+is_mark_queue_empty(rb_objspace_t *objspace)
+{
+    return objspace->mark_queue.head == NULL;
+}
+
 static void
 gc_grey(rb_objspace_t *objspace, VALUE obj)
 {
+    struct heap_page *page = GET_HEAP_PAGE(obj);
+
 #if RGENGC_CHECK_MODE
     if (RVALUE_MARKED(objspace, obj) == FALSE) rb_bug("gc_grey: %s is not marked.", rb_obj_info(obj));
     if (RVALUE_MARKING(objspace, obj) == TRUE) rb_bug("gc_grey: %s is marking/remembered.", rb_obj_info(obj));
 #endif
 
-    if (is_incremental_marking(objspace)) {
-        _BITMAP_FIELD_SET(GET_HEAP_PAGE(obj), obj, marking);
-    }
+    /* Always set marking bit to track grey state (Green Tea approach).
+     * Grey objects = mark bit set AND marking bit set (children not yet scanned). */
+    _BITMAP_FIELD_SET(page, obj, marking);
 
     if (RB_FL_TEST_RAW(obj, RUBY_FL_WEAK_REFERENCE)) {
         rb_darray_append_without_gc(&objspace->weak_references, obj);
     }
 
-    push_mark_stack(&objspace->mark_stack, obj);
+    /* Enqueue the page rather than pushing the individual object.
+     * This enables cache-friendly page-at-a-time scanning. */
+    mark_queue_enqueue(objspace, page);
 }
 
 static inline void
@@ -4624,65 +4484,211 @@ gc_mark_children(rb_objspace_t *objspace, VALUE obj)
 }
 
 /**
+ * Green Tea-style page-queue marking.
+ * Scans pages from a FIFO queue, processing grey objects (marking bit set)
+ * in memory order within each page for cache locality.
+ *
  * incremental: 0 -> not incremental (do all)
  * incremental: n -> mark at most `n' objects
  */
 static inline int
-gc_mark_stacked_objects(rb_objspace_t *objspace, int incremental, size_t count)
+gc_mark_queued_pages(rb_objspace_t *objspace, int incremental, size_t count)
 {
-    mark_stack_t *mstack = &objspace->mark_stack;
-    VALUE obj;
     size_t marked_slots_at_the_beginning = objspace->marked_slots;
-    size_t popped_count = 0;
+    size_t scanned_count = 0;
 
-    while (pop_mark_stack(mstack, &obj)) {
-        if (obj == Qundef) continue; /* skip */
+    while (objspace->mark_queue.head) {
+        struct heap_page *page = mark_queue_dequeue(objspace);
+        short slot_size = page->slot_size;
+        int total_slots = page->total_slots;
+        int bitmap_plane_count = CEILDIV(total_slots, BITS_BITLENGTH);
 
-        if (RGENGC_CHECK_MODE && !RVALUE_MARKED(objspace, obj)) {
-            rb_bug("gc_mark_stacked_objects: %s is not marked.", rb_obj_info(obj));
-        }
-        gc_mark_children(objspace, obj);
+        /* Scan grey objects on this page in memory order */
+        uintptr_t p = page->start;
+        for (int i = 0; i < bitmap_plane_count; i++) {
+            /* Snapshot and clear grey bits for this group.
+             * New grey objects may appear during scanning (from gc_mark -> gc_grey),
+             * which will re-enqueue the page. */
+            bits_t grey = page->bitmaps[i].marking;
+            if (grey) {
+                page->bitmaps[i].marking &= ~grey;
 
-        if (incremental) {
-            if (RGENGC_CHECK_MODE && !RVALUE_MARKING(objspace, obj)) {
-                rb_bug("gc_mark_stacked_objects: incremental, but marking bit is 0");
+                do {
+                    int bit = ntz_intptr(grey);
+                    grey &= grey - 1; /* clear lowest set bit */
+
+                    VALUE obj = (VALUE)(p + (size_t)bit * slot_size);
+
+                    if (RGENGC_CHECK_MODE && !RVALUE_MARKED(objspace, obj)) {
+                        rb_bug("gc_mark_queued_pages: %s is not marked.", rb_obj_info(obj));
+                    }
+
+                    gc_mark_children(objspace, obj);
+                    scanned_count++;
+
+                    if (incremental &&
+                        scanned_count + (objspace->marked_slots - marked_slots_at_the_beginning) > count) {
+                        /* Re-enqueue this page if it still has grey objects
+                         * (from remaining bits in this group or later groups) */
+                        bits_t remaining = grey; /* unprocessed bits in current group */
+                        if (remaining) {
+                            page->bitmaps[i].marking |= remaining;
+                        }
+                        for (int j = i + 1; j < bitmap_plane_count; j++) {
+                            if (page->bitmaps[j].marking) {
+                                remaining = 1; /* flag to re-enqueue */
+                                break;
+                            }
+                        }
+                        if (remaining) {
+                            mark_queue_enqueue(objspace, page);
+                        }
+                        goto done;
+                    }
+                } while (grey);
             }
-            _BITMAP_FIELD_CLEAR(GET_HEAP_PAGE(obj), obj, marking);
-            popped_count++;
-
-            if (popped_count + (objspace->marked_slots - marked_slots_at_the_beginning) > count) {
-                break;
-            }
-        }
-        else {
-            /* just ignore marking bits */
+            p += BITS_BITLENGTH * slot_size;
         }
     }
 
+done:
     if (RGENGC_CHECK_MODE >= 3) gc_verify_internal_consistency(objspace);
 
-    if (is_mark_stack_empty(mstack)) {
-        shrink_stack_chunk_cache(mstack);
-        return TRUE;
-    }
-    else {
-        return FALSE;
-    }
+    return is_mark_queue_empty(objspace);
 }
 
 static int
 gc_mark_stacked_objects_incremental(rb_objspace_t *objspace, size_t count)
 {
-    return gc_mark_stacked_objects(objspace, TRUE, count);
+    return gc_mark_queued_pages(objspace, TRUE, count);
 }
 
 static int
 gc_mark_stacked_objects_all(rb_objspace_t *objspace)
 {
-    return gc_mark_stacked_objects(objspace, FALSE, 0);
+    return gc_mark_queued_pages(objspace, FALSE, 0);
 }
 
 #if RGENGC_CHECK_MODE >= 4
+
+/* Mark stack functions for allrefs verification only.
+ * Normal GC marking uses the page-based mark queue (Green Tea style). */
+static stack_chunk_t *
+stack_chunk_alloc(void)
+{
+    stack_chunk_t *res;
+
+    res = malloc(sizeof(stack_chunk_t));
+    if (!res)
+        rb_memerror();
+
+    return res;
+}
+
+static void
+mark_stack_chunk_list_free(stack_chunk_t *chunk)
+{
+    stack_chunk_t *next = NULL;
+
+    while (chunk != NULL) {
+        next = chunk->next;
+        free(chunk);
+        chunk = next;
+    }
+}
+
+static inline int
+is_mark_stack_empty(mark_stack_t *stack)
+{
+    return stack->chunk == NULL;
+}
+
+static void
+add_stack_chunk_cache(mark_stack_t *stack, stack_chunk_t *chunk)
+{
+    chunk->next = stack->cache;
+    stack->cache = chunk;
+    stack->cache_size++;
+}
+
+static void
+push_mark_stack_chunk(mark_stack_t *stack)
+{
+    stack_chunk_t *next;
+
+    GC_ASSERT(stack->index == stack->limit);
+
+    if (stack->cache_size > 0) {
+        next = stack->cache;
+        stack->cache = stack->cache->next;
+        stack->cache_size--;
+        if (stack->unused_cache_size > stack->cache_size)
+            stack->unused_cache_size = stack->cache_size;
+    }
+    else {
+        next = stack_chunk_alloc();
+    }
+    next->next = stack->chunk;
+    stack->chunk = next;
+    stack->index = 0;
+}
+
+static void
+pop_mark_stack_chunk(mark_stack_t *stack)
+{
+    stack_chunk_t *prev;
+
+    prev = stack->chunk->next;
+    GC_ASSERT(stack->index == 0);
+    add_stack_chunk_cache(stack, stack->chunk);
+    stack->chunk = prev;
+    stack->index = stack->limit;
+}
+
+static void
+free_stack_chunks(mark_stack_t *stack)
+{
+    mark_stack_chunk_list_free(stack->chunk);
+}
+
+static void
+push_mark_stack(mark_stack_t *stack, VALUE obj)
+{
+    if (stack->index == stack->limit) {
+        push_mark_stack_chunk(stack);
+    }
+    stack->chunk->data[stack->index++] = obj;
+}
+
+static int
+pop_mark_stack(mark_stack_t *stack, VALUE *data)
+{
+    if (is_mark_stack_empty(stack)) {
+        return FALSE;
+    }
+    if (stack->index == 1) {
+        *data = stack->chunk->data[--stack->index];
+        pop_mark_stack_chunk(stack);
+    }
+    else {
+        *data = stack->chunk->data[--stack->index];
+    }
+    return TRUE;
+}
+
+static void
+init_mark_stack(mark_stack_t *stack)
+{
+    int i;
+
+    MEMZERO(stack, mark_stack_t, 1);
+    stack->index = stack->limit = STACK_CHUNK_SIZE;
+
+    for (i=0; i < 4; i++) {
+        add_stack_chunk_cache(stack, stack_chunk_alloc());
+    }
+    stack->unused_cache_size = stack->cache_size;
+}
 
 #define MAKE_ROOTSIG(obj) (((VALUE)(obj) << 1) | 0x01)
 #define IS_ROOTSIG(obj)   ((VALUE)(obj) & 0x01)
@@ -5389,9 +5395,9 @@ gc_marks_finish(rb_objspace_t *objspace)
 {
     /* finish incremental GC */
     if (is_incremental_marking(objspace)) {
-        if (RGENGC_CHECK_MODE && is_mark_stack_empty(&objspace->mark_stack) == 0) {
-            rb_bug("gc_marks_finish: mark stack is not empty (%"PRIdSIZE").",
-                   mark_stack_size(&objspace->mark_stack));
+        if (RGENGC_CHECK_MODE && !is_mark_queue_empty(objspace)) {
+            rb_bug("gc_marks_finish: mark queue is not empty (%"PRIdSIZE" pages).",
+                   objspace->mark_queue.page_count);
         }
 
         mark_roots(objspace, NULL);
@@ -5741,8 +5747,8 @@ gc_marks_continue(rb_objspace_t *objspace, rb_heap_t *heap)
         marking_finished = gc_marks_step(objspace, objspace->rincgc.step_slots);
     }
     else {
-        gc_report(2, objspace, "gc_marks_continue: no more pooled pages (stack depth: %"PRIdSIZE").\n",
-                  mark_stack_size(&objspace->mark_stack));
+        gc_report(2, objspace, "gc_marks_continue: no more pooled pages (mark queue: %"PRIdSIZE" pages).\n",
+                  objspace->mark_queue.page_count);
         heap->force_incremental_marking_finish_count++;
         gc_marks_rest(objspace);
     }
@@ -5758,6 +5764,11 @@ gc_marks_start(rb_objspace_t *objspace, int full_mark)
     /* start marking */
     gc_report(1, objspace, "gc_marks_start: (%s)\n", full_mark ? "full" : "minor");
     gc_mode_transition(objspace, gc_mode_marking);
+
+    /* Reset page mark queue */
+    objspace->mark_queue.head = NULL;
+    objspace->mark_queue.tail = NULL;
+    objspace->mark_queue.page_count = 0;
 
     if (full_mark) {
         size_t incremental_marking_steps = (objspace->rincgc.pooled_slots / INCREMENTAL_MARK_STEP_ALLOCATIONS) + 1;
@@ -5804,8 +5815,8 @@ gc_marks_start(rb_objspace_t *objspace, int full_mark)
 
     mark_roots(objspace, NULL);
 
-    gc_report(1, objspace, "gc_marks_start: (%s) end, stack in %"PRIdSIZE"\n",
-              full_mark ? "full" : "minor", mark_stack_size(&objspace->mark_stack));
+    gc_report(1, objspace, "gc_marks_start: (%s) end, mark queue %"PRIdSIZE" pages\n",
+              full_mark ? "full" : "minor", objspace->mark_queue.page_count);
 }
 
 static bool
@@ -6004,6 +6015,8 @@ rgengc_mark_and_rememberset_clear(rb_objspace_t *objspace, rb_heap_t *heap)
         }
         page->flags.has_uncollectible_wb_unprotected_objects = FALSE;
         page->flags.has_remembered_objects = FALSE;
+        page->flags.in_mark_queue = 0;
+        page->mark_queue_next = NULL;
     }
 }
 
@@ -9371,9 +9384,6 @@ rb_gc_impl_objspace_free(void *objspace_ptr)
         heap->total_slots = 0;
     }
 
-    free_stack_chunks(&objspace->mark_stack);
-    mark_stack_free_cache(&objspace->mark_stack);
-
     rb_darray_free_without_gc(objspace->weak_references);
 
     free(objspace);
@@ -9542,8 +9552,6 @@ rb_gc_impl_objspace_init(void *objspace_ptr)
         /* Set the default value of heap_init_slots. */
         gc_params.heap_init_slots[i] = GC_HEAP_INIT_SLOTS;
     }
-
-    init_mark_stack(&objspace->mark_stack);
 
     objspace->profile.invoke_time = getrusage_time();
     finalizer_table = st_init_numtable();
