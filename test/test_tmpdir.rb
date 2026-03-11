@@ -28,7 +28,11 @@ class TestTmpdir < Test::Unit::TestCase
           ENV[e] = tmpdir
           assert_equal(tmpdir, Dir.tmpdir)
           File.chmod(0555, tmpdir)
-          assert_not_equal(tmpdir, assert_warn(/\A#{e} is not writable/) {Dir.tmpdir})
+          # eaccess(2) always succeeds for root, so File.writable? is true
+          # regardless of permission bits.
+          unless Process.euid == 0
+            assert_not_equal(tmpdir, assert_warn(/\A#{e} is not writable/) {Dir.tmpdir})
+          end
           File.chmod(0777, tmpdir)
           assert_not_equal(tmpdir, assert_warn(/\A#{e} is world-writable/) {Dir.tmpdir})
           newdir = Dir.mktmpdir("d", tmpdir) do |dir|
