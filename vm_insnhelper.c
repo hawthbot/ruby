@@ -801,6 +801,14 @@ rb_vm_frame_method_entry_unchecked(const rb_control_frame_t *cfp)
     rb_callable_method_entry_t *me;
 
     while (!VM_ENV_LOCAL_P_UNCHECKED(ep)) {
+        if (UNLIKELY(!FIXNUM_P(ep[VM_ENV_DATA_INDEX_FLAGS]))) {
+            // vm_make_env_each overwrites the on-stack flags slot with the
+            // env object (for GC and svar_lep).  A signal-based profiler
+            // calling rb_profile_frames can observe this mid-escape state.
+            // Follow the env to the heap ep where the real flags live.
+            ep = ((const rb_env_t *)ep[VM_ENV_DATA_INDEX_FLAGS])->ep;
+            continue;
+        }
         if ((me = env_method_entry_unchecked(ep[VM_ENV_DATA_INDEX_ME_CREF], FALSE)) != NULL) return me;
         ep = VM_ENV_PREV_EP_UNCHECKED(ep);
     }
