@@ -77,7 +77,8 @@ typedef struct rb_callable_method_entry_struct { /* same fields with rb_method_e
 #define METHOD_ENTRY_INVALIDATED_SET(me)     ((me)->flags |= IMEMO_FL_USER5)
 
 static inline void
-METHOD_ENTRY_CACHED_SET(rb_callable_method_entry_t *me) {
+METHOD_ENTRY_CACHED_SET(rb_callable_method_entry_t *me)
+{
     if (!METHOD_ENTRY_CACHED(me)) {
         me->flags |= IMEMO_FL_USER4;
     }

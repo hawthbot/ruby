@@ -417,7 +417,7 @@ gccct_method_search_slowpath(rb_vm_t *vm, VALUE klass, unsigned int index, const
 
     vm_search_method_slowpath0(vm->self, &cd, klass);
 
-    rbimpl_atomic_ptr_store((volatile void **)&vm->global_cc_cache_table[index], (void **)cd.cc, RBIMPL_ATOMIC_RELEASE);
+    rbimpl_atomic_ptr_store((volatile void **)&vm->global_cc_cache_table[index], (void *)cd.cc, RBIMPL_ATOMIC_RELEASE);
     return cd.cc;
 }
 
