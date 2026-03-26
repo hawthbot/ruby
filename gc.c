@@ -2191,9 +2191,9 @@ rb_define_finalizer(VALUE obj, VALUE block)
         long len = RARRAY_LEN(fin->as.callback.callbacks);
         for (long i = 0; i < len; i++) {
             if (rb_equal(RARRAY_AREF(fin->as.callback.callbacks, i), block)) {
-                block = rb_ary_new3(2, INT2FIX(0), block);
-                OBJ_FREEZE(block);
-                return block;
+                VALUE ret = rb_ary_new3(2, INT2FIX(0), RARRAY_AREF(fin->as.callback.callbacks, i));
+                OBJ_FREEZE(ret);
+                return ret;
             }
         }
         rb_ary_push(fin->as.callback.callbacks, block);

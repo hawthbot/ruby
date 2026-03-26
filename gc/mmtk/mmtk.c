@@ -1058,6 +1058,7 @@ rb_gc_impl_each_object(void *objspace_ptr, void (*func)(VALUE, void *), void *da
 void
 rb_gc_impl_shutdown_call_finalizer(void *objspace_ptr)
 {
+    struct objspace *objspace = objspace_ptr;
     unsigned int lev = RB_GC_VM_LOCK();
     {
         struct MMTk_ractor_cache *rc;
