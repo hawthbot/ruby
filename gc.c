@@ -1873,6 +1873,12 @@ finalizer_fire_ready_queue(void *data)
     rb_gc_unset_pending_interrupt();
 }
 
+static void
+io_fptr_finalize_free(void *fptr)
+{
+    rb_io_fptr_finalize((struct rb_io *)fptr);
+}
+
 /* Extract dfree function and data pointer from a target object. */
 static void
 extract_dfree_from_target(VALUE target, void (**dfree)(void *), void **data)
@@ -1894,7 +1900,7 @@ extract_dfree_from_target(VALUE target, void (**dfree)(void *), void **data)
         break;
       case T_FILE:
         if (RFILE(target)->fptr) {
-            *dfree = (void (*)(void *))rb_io_fptr_finalize;
+            *dfree = io_fptr_finalize_free;
             *data = RFILE(target)->fptr;
         }
         break;
