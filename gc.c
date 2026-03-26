@@ -1839,10 +1839,7 @@ finalizer_fire_ready_queue(void *data)
 
     if (!queue) return;
 
-    /* Guard against NULL EC — can happen when postponed job fires
-     * during ractor teardown or from a GC worker thread context. */
-    rb_execution_context_t *ec = GET_EC();
-    if (ec) rb_gc_set_pending_interrupt();
+    rb_gc_set_pending_interrupt();
 
     while (queue) {
         struct rb_weak_finalizer *fin = RTYPEDDATA_GET_DATA(queue);
@@ -1873,7 +1870,7 @@ finalizer_fire_ready_queue(void *data)
         queue = next;
     }
 
-    if (ec) rb_gc_unset_pending_interrupt();
+    rb_gc_unset_pending_interrupt();
 }
 
 static void
