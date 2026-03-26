@@ -3548,6 +3548,17 @@ rb_gc_mark_roots(void *objspace, const char **categoryp)
     if (dfree_finalizer_list) {
         mark_dfree_finalizer_list();
     }
+    /* Mark finalizers in the ready-to-fire queue — these have been
+     * dequeued from finalizer_table/dfree_finalizer_list and are
+     * waiting for a postponed job to process them. */
+    {
+        VALUE node = finalizer_ready_queue;
+        while (node) {
+            rb_gc_mark(node);
+            struct rb_weak_finalizer *fin = RTYPEDDATA_GET_DATA(node);
+            node = fin->next_queued;
+        }
+    }
 
     MARK_CHECKPOINT("vm");
     rb_vm_mark(vm);
