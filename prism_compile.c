@@ -10342,7 +10342,16 @@ pm_compile_node(rb_iseq_t *iseq, const pm_node_t *node, LINK_ANCHOR *const ret, 
 
         ID singletonclass;
         CONST_ID(singletonclass, "singletonclass");
-        PUSH_INSN3(ret, location, defineclass, ID2SYM(singletonclass), child_iseq, INT2FIX(VM_DEFINECLASS_TYPE_SINGLETON_CLASS));
+
+        /* `class << self` in a class body is stable (same CREF every time).
+           All other `class << x` forms are potentially dynamic. */
+        int sclass_flags = VM_DEFINECLASS_TYPE_SINGLETON_CLASS;
+        if (!(PM_NODE_TYPE_P(cast->expression, PM_SELF_NODE) &&
+              ISEQ_BODY(iseq)->type == ISEQ_TYPE_CLASS)) {
+            sclass_flags |= VM_DEFINECLASS_FLAG_DYNAMIC_SCLASS;
+        }
+
+        PUSH_INSN3(ret, location, defineclass, ID2SYM(singletonclass), child_iseq, INT2FIX(sclass_flags));
 
         if (popped) PUSH_INSN(ret, location, pop);
         RB_OBJ_WRITTEN(iseq, Qundef, (VALUE) child_iseq);

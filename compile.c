@@ -11477,9 +11477,18 @@ iseq_compile_each0(rb_iseq_t *iseq, LINK_ANCHOR *const ret, const NODE *const no
         CHECK(COMPILE(ret, "sclass#recv", RNODE_SCLASS(node)->nd_recv));
         ADD_INSN (ret, node, putnil);
         CONST_ID(singletonclass, "singletonclass");
+
+        /* `class << self` in a class body is stable (same CREF every time).
+           All other `class << x` forms are potentially dynamic. */
+        int sclass_flags = VM_DEFINECLASS_TYPE_SINGLETON_CLASS;
+        if (!(nd_type_p(RNODE_SCLASS(node)->nd_recv, NODE_SELF) &&
+              ISEQ_BODY(iseq)->type == ISEQ_TYPE_CLASS)) {
+            sclass_flags |= VM_DEFINECLASS_FLAG_DYNAMIC_SCLASS;
+        }
+
         ADD_INSN3(ret, node, defineclass,
                   ID2SYM(singletonclass), singleton_class,
-                  INT2FIX(VM_DEFINECLASS_TYPE_SINGLETON_CLASS));
+                  INT2FIX(sclass_flags));
         RB_OBJ_WRITTEN(iseq, Qundef, (VALUE)singleton_class);
 
         if (popped) {
